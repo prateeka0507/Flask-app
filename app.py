@@ -27,7 +27,7 @@ MAX_RESULTS = 1000
 logging.basicConfig(level=logging.DEBUG)
 
 # Initialize OpenAI
-client = OpenAI(api_key=openai_api_key)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Initialize Pinecone
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -42,15 +42,7 @@ if INDEX_NAME not in pc.list_indexes().names():
     )
 
 # Get the index
-index = pc.Index(INDEX_NAME)
-
-# Add this after initializing the Pinecone index
-try:
-    test_query = [0] * 1536  # Create a dummy vector of 1536 dimensions
-    test_result = index.query(vector=test_query, top_k=1, namespace="ns1")
-    logging.info(f"Test query result: {test_result}")
-except Exception as e:
-    logging.error(f"Error querying Pinecone: {str(e)}")
+pinecone_index = pc.Index(INDEX_NAME)
 
 # Define helper functions
 def truncate_text(text, max_tokens):
@@ -90,14 +82,18 @@ def semantic_similarity(text1, text2):
 
 def expand_query(original_query):
     try:
+        expansion_prompt = f"Expand the following query into 3-5 related questions or terms: '{original_query}'"
+        
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",  # Use a simpler model for testing
-            messages=[{"role": "user", "content": "Hello, world!"}],
-            max_tokens=10
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": expansion_prompt}],
+            max_tokens=100,
+            temperature=0.7
         )
-        logging.info(f"Test OpenAI response: {response}")
+        return original_query + " " + response.choices[0].message.content
     except Exception as e:
-        logging.error(f"Error calling OpenAI API: {str(e)}")
+        logging.error(f"Error in query expansion: {str(e)}")
+        return original_query  # Return original query if expansion fails
 
 def truncate_context(context, max_tokens=14000):
     encoding = tiktoken.get_encoding("cl100k_base")
@@ -107,15 +103,15 @@ def truncate_context(context, max_tokens=14000):
 
 @app.route('/')
 def index():
-    return send_from_directory('templates', 'index.html')
+    return send_from_directory('.', 'index.html')
 
 @app.route('/styles.css')
 def styles():
-    return send_from_directory('static', 'styles.css')
+    return send_from_directory('.', 'styles.css')
 
 @app.route('/script.js')
 def script():
-    return send_from_directory('static', 'script.js')
+    return send_from_directory('.', 'script.js')
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
@@ -148,7 +144,7 @@ def upload_file():
                 vectors.append({'id': str(row['ID']), 'values': embedding, 'metadata': metadata})
 
         if vectors:
-            upsert_in_batches(index, vectors, BATCH_SIZE)
+            upsert_in_batches(pinecone_index, vectors, BATCH_SIZE)
             return jsonify({
                 "message": "Data uploaded successfully",
                 "totalTokensUsed": total_tokens_used,
@@ -171,25 +167,26 @@ def process_query():
         logging.info(f"Expanded query: {expanded_query}")
         
         query_embedding, tokens_used = generate_embedding(expanded_query)
+        if query_embedding is None:
+            logging.error("Failed to generate query embedding")
+            return jsonify({"error": "Failed to generate query embedding"}), 400
+        
         logging.info(f"Generated embedding, tokens used: {tokens_used}")
         
-        if query_embedding is not None:
-            results = index.query(
-                namespace="ns1",
-                vector=query_embedding,
-                top_k=50,
-                include_metadata=True
-            )
-            logging.info(f"Pinecone query results: {results}")
+        results = pinecone_index.query(
+            namespace="ns1",
+            vector=query_embedding,
+            top_k=50,
+            include_metadata=True
+        )
 
-            filtered_results = sorted(
+        filtered_results = sorted(
                 results['matches'],
                 key=lambda x: semantic_similarity(query, x['metadata']['combined_text']),
                 reverse=True
             )[:10]
-            logging.info(f"Filtered results: {filtered_results}")
 
-            context = "\n".join([
+        context = "\n".join([
                 f"ID: {match['id']}\n" +
                 f"Event Date/Time: {match['metadata'].get('eventDtgTime', 'N/A')}\n" +
                 f"Display Title: {match['metadata'].get('displayTitle', 'N/A')}\n" +
@@ -199,35 +196,31 @@ def process_query():
                 for match in filtered_results
             ])
 
-            truncated_context = truncate_context(context)
-            logging.info(f"Truncated context: {truncated_context}")
+        truncated_context = truncate_context(context)
 
-            system_prompt = """You are an AI assistant specializing in analyzing SITREP data. Provide a comprehensive answer based on the given context. Focus on key patterns, trends, and relevant details. If information is missing, state what is known and what is uncertain."""
-            user_prompt = f"""Query: {query}
+        system_prompt = """You are an AI assistant specializing in analyzing SITREP data. Provide a comprehensive answer based on the given context. Focus on key patterns, trends, and relevant details. If information is missing, state what is known and what is uncertain."""
+        user_prompt = f"""Query: {query}
     Relevant Information:
     {truncated_context}
     Provide a clear, concise, and comprehensive answer. Synthesize information from multiple entries if necessary. Cite specific details and examples when applicable. If information is missing, state what is known and what remains uncertain."""
 
-            response = client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_tokens=1000,
-                temperature=0.7
-            )
-            logging.info(f"OpenAI response: {response}")
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.7
+        )
 
-            answer = response.choices[0].message.content
-            return jsonify({"answer": answer})
-        else:
-            return jsonify({"error": "Failed to generate query embedding"}), 400
+        answer = response.choices[0].message.content
+        return jsonify({"answer": answer})
     except Exception as e:
         logging.error(f"Error in process_query: {str(e)}")
         logging.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
-    
+
 @app.errorhandler(Exception)
 def handle_exception(e):
     logging.error(f"Unhandled exception: {str(e)}")
